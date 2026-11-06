@@ -997,6 +997,22 @@ class CloudPoolApp:
         )
         del_remote_btn.pack(side=tk.LEFT, padx=(0, 6))
 
+        reconnect_btn = tk.Button(
+            acc_bar,
+            text="🔌 Reconnect Remote",
+            font=("Segoe UI", 9, "bold"),
+            bg=BG_CARD_LIGHT,
+            fg=ACCENT_CYAN,
+            activebackground=BG_CARD,
+            activeforeground=ACCENT_CYAN,
+            relief="flat",
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=self._on_reconnect_account
+        )
+        reconnect_btn.pack(side=tk.LEFT, padx=(0, 6))
+
         test_btn = tk.Button(
             acc_bar,
             text="🩺 Test Remotes Connectivity",
@@ -2156,11 +2172,31 @@ class CloudPoolApp:
             })
 
         try:
-            self.net_engine.delete_file(file_id, progress_callback=progress_callback)
-            self.msg_queue.put({
-                "type": "delete_success",
-                "file_name": file_name
-            })
+            res = self.net_engine.delete_file(file_id, progress_callback=progress_callback)
+            status = res.get("status") if isinstance(res, dict) else "completed"
+            if status == "completed":
+                self.msg_queue.put({
+                    "type": "delete_success",
+                    "file_name": file_name,
+                    "deleted_chunks": res.get("deleted_chunks", 0)
+                })
+            elif status == "partially_deleted":
+                self.msg_queue.put({
+                    "type": "delete_partial",
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "deleted": res.get("deleted_chunks", 0),
+                    "failed": res.get("failed_chunks", 0),
+                    "error_message": res.get("error_message", "Some chunks failed remote deletion.")
+                })
+            elif status == "failed":
+                self.msg_queue.put({
+                    "type": "delete_failed",
+                    "file_id": file_id,
+                    "file_name": file_name,
+                    "failed": res.get("failed_chunks", 0),
+                    "error_message": res.get("error_message", "Remote deletion failed.")
+                })
         except Exception as e:
             self.msg_queue.put({
                 "type": "error",
@@ -2185,11 +2221,30 @@ class CloudPoolApp:
             })
 
         try:
-            self.net_engine.delete_virtual_folder(folder_id, progress_callback=progress_callback)
-            self.msg_queue.put({
-                "type": "delete_success",
-                "file_name": f"Folder: {folder_name}"
-            })
+            res = self.net_engine.delete_virtual_folder(folder_id, progress_callback=progress_callback)
+            status = res.get("status") if isinstance(res, dict) else "completed"
+            if status == "completed":
+                self.msg_queue.put({
+                    "type": "delete_success",
+                    "file_name": f"Folder: {folder_name}"
+                })
+            elif status == "partially_deleted":
+                self.msg_queue.put({
+                    "type": "delete_partial",
+                    "file_id": folder_id,
+                    "file_name": f"Folder: {folder_name}",
+                    "deleted": res.get("deleted_files", 0),
+                    "failed": res.get("failed_files", 0),
+                    "error_message": "Some files or chunks in the folder could not be deleted from remote accounts."
+                })
+            else:
+                self.msg_queue.put({
+                    "type": "delete_failed",
+                    "file_id": folder_id,
+                    "file_name": f"Folder: {folder_name}",
+                    "failed": 1,
+                    "error_message": "Remote deletion failed for folder container."
+                })
         except Exception as e:
             self.msg_queue.put({
                 "type": "error",
@@ -2203,9 +2258,17 @@ class CloudPoolApp:
     # METADATA MIRRORING & DISASTER RECOVERY
     # -------------------------------------------------------------
     def _on_manual_metadata_sync(self):
-        """Manually mirrors encrypted metadata database to 2 cloud accounts."""
-        self.log("[METADATA] Packaging and encrypting database + master key...")
-        remotes = MetadataEngine.sync_metadata_to_cloud(self.db)
+        """Manually mirrors encrypted metadata database to 2 cloud accounts using user recovery passphrase."""
+        passphrase = self._dark_input_dialog(
+            "Metadata Backup Passphrase",
+            "Enter a secure passphrase to encrypt your cloud metadata backup:",
+            show="*"
+        )
+        if not passphrase:
+            return
+
+        self.log("[METADATA] Packaging and encrypting database + master key with PBKDF2 (600,000 iters)...")
+        remotes = MetadataEngine.sync_metadata_to_cloud(self.db, passphrase=passphrase)
         if remotes:
             msg = f"Encrypted metadata database mirrored successfully to: {', '.join(remotes)}"
             self.log(f"[METADATA SUCCESS] {msg}")
@@ -2440,10 +2503,49 @@ class CloudPoolApp:
 
                 elif mtype == "delete_success":
                     file_name = msg.get("file_name")
-                    self.log(f"[SUCCESS] Remote chunks for '{file_name}' wiped and space reclaimed.")
+                    self.log(f"[SUCCESS] Remote chunks for '{file_name}' confirmed wiped and storage reclaimed.")
+                    self.refresh_all_data()
                     messagebox.showinfo(
-                        "File Wiped",
-                        f"'{file_name}' has been completely deleted from your cloud accounts and pool space has been reclaimed!"
+                        "File Wiped Successfully",
+                        f"'{file_name}' has been completely deleted from your cloud accounts.\n\nAll remote chunks were confirmed removed and pool space was reclaimed!"
+                    )
+
+                elif mtype == "delete_partial":
+                    file_id = msg.get("file_id")
+                    file_name = msg.get("file_name")
+                    deleted_cnt = msg.get("deleted", 0)
+                    failed_cnt = msg.get("failed", 0)
+                    err_msg = msg.get("error_message", "")
+                    self.log(f"[PARTIAL DELETION] '{file_name}': {deleted_cnt} chunks wiped, {failed_cnt} failed ({err_msg})")
+                    self.refresh_all_data()
+                    retry = messagebox.askyesno(
+                        "Partial Deletion — Retry Remaining Chunks?",
+                        f"Deletion for '{file_name}' is partially complete:\n\n"
+                        f"• {deleted_cnt} chunk(s) confirmed deleted & quota reclaimed.\n"
+                        f"• {failed_cnt} chunk(s) failed to delete.\n\n"
+                        f"Failure Details:\n{err_msg[:200]}\n\n"
+                        f"Metadata for the remaining {failed_cnt} chunk(s) has been safely preserved in your vault.\n\n"
+                        f"Would you like to retry deleting the remaining chunks now?",
+                        parent=self.root
+                    )
+                    if retry and file_id:
+                        self.log(f"[RETRY DELETION] Retrying deletion for '{file_name}'...")
+                        self._delete_file_prompt(file_id, file_name)
+
+                elif mtype == "delete_failed":
+                    file_id = msg.get("file_id")
+                    file_name = msg.get("file_name")
+                    err_msg = msg.get("error_message", "Remote cloud error")
+                    self.log(f"[DELETION FAILED] '{file_name}': Remote deletion failed ({err_msg})")
+                    self.refresh_all_data()
+                    messagebox.showerror(
+                        "Deletion Failed",
+                        f"Could not delete '{file_name}' from remote cloud accounts:\n\n"
+                        f"{err_msg[:300]}\n\n"
+                        f"• All file metadata and chunks have been preserved in your vault.\n"
+                        f"• Storage quota was NOT decremented.\n"
+                        f"• You can retry deletion when the remotes are online.",
+                        parent=self.root
                     )
 
                 elif mtype in ("upload_finished", "download_finished", "delete_finished"):
@@ -2654,7 +2756,15 @@ class CloudPoolApp:
 
             # 2. Files second
             for fl in contents["files"]:
-                parity_label = "✅ Protected (RAID-5)" if fl.get("has_parity") else "⚠️ No Parity"
+                del_status = fl.get("deletion_status", "active")
+                if del_status == "partially_deleted":
+                    parity_label = "⚠️ Partially Deleted (Retry)"
+                elif del_status == "failed":
+                    parity_label = "❌ Deletion Failed (Retry)"
+                elif fl.get("has_parity"):
+                    parity_label = "✅ Protected (RAID-5)"
+                else:
+                    parity_label = "⚠️ No Parity"
                 ext = fl['file_name'].split('.')[-1].upper() if '.' in fl['file_name'] else "File"
                 self.files_tree.insert(
                     "",
@@ -2718,9 +2828,13 @@ class CloudPoolApp:
                 # Pre-flight ping & Rclone config validation
                 acc_name = a["account_name"]
                 in_rclone = self.db.is_remote_in_rclone_config(acc_name)
+                acc_status = a.get("status", "CONNECTED")
 
-                if not in_rclone:
-                    status_str = "🔴 Missing in rclone.conf"
+                if acc_status == "DISCONNECTED":
+                    chunks_held = self.db.get_account_chunks_count(acc_name)["count"]
+                    status_str = f"⚪ Disconnected ({chunks_held} chunks preserved)" if chunks_held > 0 else "⚪ Disconnected (No data)"
+                elif not in_rclone:
+                    status_str = "🔴 Missing in rclone.conf (Offline)"
                 elif util_pct >= 99.0:
                     status_str = f"🔴 Full / Limit Hit ({util_pct:.1f}%)"
                 elif util_pct >= 90.0:
@@ -2776,10 +2890,10 @@ class CloudPoolApp:
             messagebox.showinfo("Rclone Synced", "All remotes in rclone.conf are already registered in CloudPool.")
 
     def _on_unregister_account(self):
-        """Removes a registered cloud remote from CloudPool."""
+        """Removes an empty cloud remote from CloudPool or safely disconnects it if it contains chunks."""
         selected = self.accounts_tree.selection()
         if not selected:
-            messagebox.showinfo("Selection Required", "Please select a cloud remote from the table to remove.")
+            messagebox.showinfo("Selection Required", "Please select a cloud remote from the table.")
             return
 
         item = self.accounts_tree.item(selected[0])
@@ -2790,34 +2904,126 @@ class CloudPoolApp:
         if not acc_name:
             return
 
-        # Check if chunks are currently stored on this remote
-        stats = self.db.get_account_chunks_count(acc_name)
-        chunks_count = stats["count"]
-        chunks_bytes = stats["bytes"]
+        # 1. Trace all references to this account in the database
+        refs = self.db.get_account_references(acc_name)
+        chunks_count = refs["chunks_count"]
+        chunks_bytes = refs["chunks_bytes"]
+        file_count = refs["file_count"]
+        file_names_preview = ", ".join(refs["file_names"][:3])
+        if len(refs["file_names"]) > 3:
+            file_names_preview += f" and {len(refs['file_names']) - 3} other(s)"
 
+        # Check if the account is already disconnected
+        cur_acc = next((a for a in self.db.get_accounts() if a["account_name"] == acc_name), None)
+        is_disconnected = (cur_acc and cur_acc.get("status") == "DISCONNECTED")
+
+        # 2. Case A: Account contains stored chunks -> DO NOT allow destructive deletion!
         if chunks_count > 0:
-            confirm = messagebox.askyesno(
-                "Warning: Remote Contains Active Chunks",
-                f"Remote '{acc_name}' currently holds {chunks_count} chunk(s) ({format_bytes(chunks_bytes)})!\n\n"
-                f"• If you remove this remote, files split across it will rely on RAID-5 parity to recover.\n"
-                f"• Are you sure you want to unregister '{acc_name}' from the pool?",
-                parent=self.root
-            )
-        else:
-            confirm = messagebox.askyesno(
-                "Confirm Remote Removal",
-                f"Are you sure you want to remove remote '{acc_name}' from CloudPool?\n\n"
-                f"This remote will no longer be used for storage routing.",
-                parent=self.root
-            )
+            if is_disconnected:
+                messagebox.showinfo(
+                    "Remote Already Disconnected",
+                    f"Remote '{acc_name}' is currently safely disconnected.\n\n"
+                    f"• Preserves {chunks_count} chunk(s) ({format_bytes(chunks_bytes)}) across {file_count} file(s).\n"
+                    f"• Stored data: {file_names_preview or 'N/A'}\n"
+                    f"• Destructive deletion is blocked to prevent data loss.\n\n"
+                    f"To restore active upload routing to this remote, click 'Reconnect Remote' or run Auto-Sync.",
+                    parent=self.root
+                )
+                return
 
+            # Offer Safe Disconnect Option
+            prompt_msg = (
+                f"Destructive Unregistration Blocked:\n"
+                f"Remote '{acc_name}' cannot be deleted because it currently stores "
+                f"{chunks_count} encrypted chunk(s) ({format_bytes(chunks_bytes)}) belonging to {file_count} virtual file(s)!\n\n"
+                f"Referenced Files: {file_names_preview or 'Active Vault Chunks'}\n\n"
+                f"Permanently removing this account would break file integrity and cause data loss.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Safe Alternative: Disconnect Remote\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Would you like to safely DISCONNECT '{acc_name}' instead?\n\n"
+                f"• The remote will be excluded from new chunk uploads.\n"
+                f"• All existing chunk metadata and encryption keys remain safely preserved.\n"
+                f"• Reconnecting the same account at any time will instantly restore full access.\n"
+                f"• No remote files will be deleted.\n\n"
+                f"Safely disconnect '{acc_name}' now?"
+            )
+            confirm_disconnect = messagebox.askyesno(
+                "Remote Contains Stored Data — Disconnect Instead?",
+                prompt_msg,
+                parent=self.root
+            )
+            if confirm_disconnect:
+                try:
+                    self.db.disconnect_account(acc_name)
+                    self.log(f"[ACCOUNT DISCONNECTED] '{acc_name}' safely disconnected. {chunks_count} chunks preserved.")
+                    self.refresh_all_data()
+                    messagebox.showinfo(
+                        "Remote Disconnected",
+                        f"Remote '{acc_name}' has been safely disconnected.\n\n"
+                        f"• {chunks_count} chunk(s) remain safely mapped in your vault.\n"
+                        f"• Reconnect this remote at any time to resume uploads.",
+                        parent=self.root
+                    )
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to disconnect remote:\n{e}", parent=self.root)
+            return
+
+        # 3. Case B: Account contains NO chunks -> Allow normal unregistration
+        confirm = messagebox.askyesno(
+            "Confirm Remote Removal",
+            f"Are you sure you want to permanently unregister remote '{acc_name}' from CloudPool?\n\n"
+            f"• Verified: This remote stores 0 data chunks.\n"
+            f"• It will be removed from your cloud pool storage table.",
+            parent=self.root
+        )
         if not confirm:
             return
 
-        self.db.unregister_account(acc_name)
-        self.log(f"[ACCOUNT REMOVED] Successfully unregistered remote '{acc_name}'.")
-        self.refresh_all_data()
-        messagebox.showinfo("Remote Removed", f"Remote '{acc_name}' has been successfully removed from CloudPool.")
+        try:
+            self.db.unregister_account(acc_name)
+            self.log(f"[ACCOUNT REMOVED] Successfully unregistered remote '{acc_name}'.")
+            self.refresh_all_data()
+            messagebox.showinfo("Remote Removed", f"Remote '{acc_name}' has been successfully removed from CloudPool.", parent=self.root)
+        except Exception as e:
+            messagebox.showerror("Unregister Error", f"Failed to unregister remote:\n\n{e}", parent=self.root)
+
+    def _on_reconnect_account(self):
+        """Re-enables a disconnected cloud remote so it can participate in chunk routing again."""
+        selected = self.accounts_tree.selection()
+        if not selected:
+            messagebox.showinfo("Selection Required", "Please select a disconnected cloud remote from the table to reconnect.")
+            return
+
+        item = self.accounts_tree.item(selected[0])
+        if "group_header" in item.get("tags", []):
+            return
+
+        acc_name = item["values"][1]
+        if not acc_name:
+            return
+
+        cur_acc = next((a for a in self.db.get_accounts() if a["account_name"] == acc_name), None)
+        if not cur_acc:
+            messagebox.showerror("Not Found", f"Remote '{acc_name}' is not found in database.")
+            return
+
+        if cur_acc.get("status") == "CONNECTED":
+            messagebox.showinfo("Already Connected", f"Remote '{acc_name}' is already connected and active.")
+            return
+
+        try:
+            self.db.reconnect_account(acc_name)
+            self.log(f"[ACCOUNT RECONNECTED] '{acc_name}' restored to active status.")
+            self.refresh_all_data()
+            messagebox.showinfo(
+                "Remote Reconnected",
+                f"Remote '{acc_name}' has been successfully reconnected!\n\n"
+                f"It is now active and ready to receive upload chunks.",
+                parent=self.root
+            )
+        except Exception as e:
+            messagebox.showerror("Reconnect Error", f"Failed to reconnect remote:\n\n{e}", parent=self.root)
 
     def _on_test_connectivity(self):
         """Probes all registered remotes in a background worker and reports their status."""

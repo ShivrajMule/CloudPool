@@ -2,6 +2,8 @@
 cloudpool_master.db
 local_vault/
 master.key
+master.key.dpapi
+master.key.migrated
 Secret_Project.txt
 
 # Local binaries and generated files
