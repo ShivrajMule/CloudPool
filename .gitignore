@@ -1,0 +1,19 @@
+# Runtime data and encryption material
+cloudpool_master.db
+local_vault/
+master.key
+Secret_Project.txt
+
+# Local binaries and generated files
+rclone.exe
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite3
+
+# Local environment and editor files
+.env
+.venv/
+venv/
+.idea/
+.vscode/
